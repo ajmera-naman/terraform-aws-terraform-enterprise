@@ -1,0 +1,8 @@
+acm_certificate_arn  = "arn:aws:acm:region:<account_id>:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxx"
+ami_id               = "ami-012345678abcdefghi"
+domain_name          = "my.domain.com"
+tags                 = {
+                        Owner       = "My Name"
+                        Environment = "standalone-airgap"
+                       }
+tfe_subdomain        = "tfe-subdomain"
