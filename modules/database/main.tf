@@ -94,7 +94,7 @@ resource "aws_db_instance" "postgresql" {
   # no special characters allowed
   db_name                = var.db_name
   port                   = 5432
-  publicly_accessible    = false
+  publicly_accessible    = true
   skip_final_snapshot    = true
   storage_encrypted      = true
   kms_key_id             = var.kms_key_arn
