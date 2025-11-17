@@ -182,6 +182,9 @@ module "database" {
   postgres_enable_iam_auth     = var.postgres_enable_iam_auth
   postgres_use_password_auth   = var.postgres_use_password_auth
   db_iam_username              = var.db_iam_username
+  # EC2 instance for database connectivity
+  network_public_subnets       = local.network_public_subnets
+  aws_iam_instance_profile     = local.database_iam_instance_profile
 }
 
 # -----------------------------------------------------------------------------
@@ -402,7 +405,6 @@ module "tfe_init" {
   database_iam_username             = var.db_iam_username
   database_passwordless_aws_use_iam = local.database_passwordless_aws_use_iam
   database_passwordless_aws_region  = var.database_passwordless_aws_region
-  postgres_iam_setup_ssm_document   = var.postgres_enable_iam_auth && var.db_iam_username != "" ? "enabled" : null
 }
 
 # --------------------------------------------------------------------------------------------

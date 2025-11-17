@@ -4,6 +4,22 @@
 # Get current AWS region
 data "aws_region" "current" {}
 
+# Get latest Ubuntu AMI
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
 # Use a fixed password for testing/development to enable direct database access
 locals {
   # For release tests, use a fixed password to allow manual IAM user setup
@@ -101,220 +117,77 @@ resource "aws_db_instance" "postgresql" {
   storage_type           = "gp2"
   vpc_security_group_ids = [aws_security_group.postgresql.id]
   
-  # Enable IAM authentication when postgres_enable_iam_auth is true
+    # Enable IAM authentication when postgres_enable_iam_auth is true
   iam_database_authentication_enabled = var.postgres_enable_iam_auth
 }
 
-# Database user setup for IAM authentication - Using SSM Run Command approach
-# This creates an SSM document that can be executed on EC2 instances with proper credentials
-resource "aws_ssm_document" "postgres_iam_user_setup" {
-  count         = var.postgres_enable_iam_auth && var.db_iam_username != "" ? 1 : 0
-  name          = "${var.friendly_name_prefix}-postgres-iam-user-setup"
-  document_type = "Command"
-  document_format = "YAML"
-  
-  content = yamlencode({
-    schemaVersion = "2.2"
-    description   = "Create PostgreSQL IAM user for RDS IAM authentication"
-    parameters = {
-      dbEndpoint = {
-        type        = "String"
-        description = "PostgreSQL RDS endpoint"
-        default     = aws_db_instance.postgresql.endpoint
-      }
-      dbUsername = {
-        type        = "String"
-        description = "PostgreSQL master username"
-        default     = aws_db_instance.postgresql.username
-      }
-      dbName = {
-        type        = "String"
-        description = "PostgreSQL database name"
-        default     = aws_db_instance.postgresql.db_name
-      }
-      iamUsername = {
-        type        = "String"
-        description = "IAM username to create in PostgreSQL"
-        default     = var.db_iam_username
-      }
-      dbPassword = {
-        type        = "String"
-        description = "PostgreSQL master password"
-        default     = local.fixed_password
-      }
-    }
-    mainSteps = [
-      {
-        action = "aws:runShellScript"
-        name   = "setupPostgresIAMUser"
-        inputs = {
-          timeoutSeconds = "300"
-          runCommand = [
-            "#!/bin/bash",
-            "set -e",
-            "echo '=== PostgreSQL IAM User Setup Started ==='",
-            "echo 'Endpoint: {{ dbEndpoint }}'",
-            "echo 'IAM User: {{ iamUsername }}'",
-            "",
-            "# Install PostgreSQL client if needed",
-            "if ! command -v psql >/dev/null 2>&1; then",
-            "  echo 'Installing PostgreSQL client...'",
-            "  if command -v apt-get >/dev/null 2>&1; then",
-            "    sudo apt-get update -qq",
-            "    sudo apt-get install -y postgresql-client",
-            "  elif command -v yum >/dev/null 2>&1; then",
-            "    sudo yum update -y -q",
-            "    sudo yum install -y postgresql15",
-            "  else",
-            "    echo 'ERROR: Cannot install PostgreSQL client'",
-            "    exit 1",
-            "  fi",
-            "fi",
-            "",
-            "# Set password for database connection",
-            "export PGPASSWORD='{{ dbPassword }}'",
-            "",
-            "# Wait for database to be ready",
-            "echo 'Waiting for database to be ready...'",
-            "max_attempts=30",
-            "attempt=0",
-            "while [ $attempt -lt $max_attempts ]; do",
-            "  if psql -h {{ dbEndpoint }} -U {{ dbUsername }} -d {{ dbName }} -c 'SELECT 1;' >/dev/null 2>&1; then",
-            "    echo 'Database is ready!'",
-            "    break",
-            "  fi",
-            "  attempt=$((attempt + 1))",
-            "  echo \"Waiting for database... attempt $attempt/$max_attempts\"",
-            "  sleep 10",
-            "done",
-            "",
-            "if [ $attempt -eq $max_attempts ]; then",
-            "  echo 'ERROR: Database not ready after $max_attempts attempts'",
-            "  exit 1",
-            "fi",
-            "",
-            "# Create IAM user",
-            "echo 'Creating IAM user...'",
-            "psql -h {{ dbEndpoint }} -U {{ dbUsername }} -d {{ dbName }} -v ON_ERROR_STOP=1 << 'EOF'",
-            "DO $$",
-            "BEGIN",
-            "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ iamUsername }}') THEN",
-            "    CREATE USER \"{{ iamUsername }}\";",
-            "    GRANT rds_iam TO \"{{ iamUsername }}\";",
-            "    GRANT CONNECT ON DATABASE \"{{ dbName }}\" TO \"{{ iamUsername }}\";",
-            "    GRANT USAGE ON SCHEMA public TO \"{{ iamUsername }}\";",
-            "    GRANT CREATE ON SCHEMA public TO \"{{ iamUsername }}\";",
-            "    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"{{ iamUsername }}\";",
-            "    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"{{ iamUsername }}\";",
-            "    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO \"{{ iamUsername }}\";",
-            "    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO \"{{ iamUsername }}\";",
-            "    RAISE NOTICE 'Successfully created IAM user: {{ iamUsername }}';",
-            "  ELSE",
-            "    RAISE NOTICE 'IAM user already exists: {{ iamUsername }}';",
-            "  END IF;",
-            "END",
-            "$$;",
-            "EOF",
-            "",
-            "echo '=== PostgreSQL IAM User Setup Completed ==='",
-            "",
-            "# Verify user creation",
-            "psql -h {{ dbEndpoint }} -U {{ dbUsername }} -d {{ dbName }} -c \"SELECT usename, usesuper FROM pg_user WHERE usename = '{{ iamUsername }}';\"",
-          ]
-        }
-      }
-    ]
-  })
+resource "tls_private_key" "postgres_db_ssh_key" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "ec2_key" {
+  key_name   = "${var.friendly_name_prefix}-ec2-postgres-key"
+  public_key = tls_private_key.postgres_db_ssh_key.public_key_openssh
+}
+
+resource "local_file" "postgres_db_private_key" {
+  content         = tls_private_key.postgres_db_ssh_key.private_key_pem
+  filename        = "${path.module}/${var.friendly_name_prefix}-ec2-postgres-key.pem"
+  file_permission = "0600"
+}
+
+resource "aws_security_group_rule" "postgres_db_ssh_ingress" {
+  security_group_id = aws_security_group.postgresql.id
+  type              = "ingress"
+  from_port         = 22
+  to_port           = 22
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+}
+
+resource "aws_instance" "postgres_db_instance" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = "m5.xlarge"
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.postgresql.id]
+  iam_instance_profile        = var.aws_iam_instance_profile
+  key_name                    = aws_key_pair.ec2_key.key_name
+  subnet_id                   = var.network_public_subnets[0]
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 100
+    delete_on_termination = true
+    encrypted             = true
+  }
 
   tags = {
-    Name = "${var.friendly_name_prefix}-postgres-iam-setup"
+    Name = "Terraform-Postgres-mTLS"
   }
 }
 
-# Create IAM user in PostgreSQL database automatically
-# This assumes Terraform runner has network access to RDS (via bastion/VPN)
 resource "null_resource" "create_iam_db_user" {
   count = var.postgres_enable_iam_auth ? 1 : 0
   
   depends_on = [aws_db_instance.postgresql]
 
-  provisioner "local-exec" {
-    environment = {
-      PGPASSWORD = local.fixed_password
-    }
-    command = <<EOT
-# Install PostgreSQL client if not present
-if ! command -v psql > /dev/null 2>&1; then
-    echo "PostgreSQL client not found. Installing..."
-    if [ -f /etc/debian_version ]; then
-        apt-get update && apt-get install -y postgresql-client
-    elif command -v brew > /dev/null 2>&1; then
-        brew install postgresql
-    else
-        echo "ERROR: Cannot install PostgreSQL client automatically"
-        echo "The IAM user will be created via user_data script instead."
-        exit 0
-    fi
-fi
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = tls_private_key.postgres_db_ssh_key.private_key_pem
+    host        = aws_instance.postgres_db_instance.public_ip
+  }
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting PostgreSQL IAM user creation for ${var.db_iam_username}"
+   provisioner "file" {
+    source      = "${path.module}/files/create_iam_user.sh"
+    destination = "/home/ubuntu/create_iam_user.sh"
+  }
 
-# Wait for database to be available
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for database ${aws_db_instance.postgresql.address} to be ready..."
-for i in $(seq 1 60); do
-  if timeout 30 psql "host=${aws_db_instance.postgresql.address} port=${aws_db_instance.postgresql.port} user=${var.db_username} dbname=${var.db_name} sslmode=require" -c "SELECT version();" >/dev/null 2>&1; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Database connection successful after $i attempts"
-    break
-  else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Database connection attempt $i/60 failed, retrying in 10 seconds..."
-    sleep 10
-  fi
-  
-  if [ $i -eq 60 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Could not connect to database after 60 attempts"
-    echo "This may be due to network access issues. The IAM user will be created via user_data script instead."
-    exit 0  # Don't fail the terraform apply
-  fi
-done
-
-# Create IAM user with proper permissions
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating IAM user: ${var.db_iam_username}"
-if psql "host=${aws_db_instance.postgresql.address} port=${aws_db_instance.postgresql.port} user=${var.db_username} dbname=${var.db_name} sslmode=require" -c "
-DO \$\$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${var.db_iam_username}') THEN
-        CREATE USER \"${var.db_iam_username}\" WITH LOGIN;
-        GRANT rds_iam TO \"${var.db_iam_username}\";
-        GRANT CONNECT ON DATABASE \"${var.db_name}\" TO \"${var.db_iam_username}\";
-        GRANT USAGE ON SCHEMA public TO \"${var.db_iam_username}\";
-        GRANT CREATE ON SCHEMA public TO \"${var.db_iam_username}\";
-        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${var.db_iam_username}\";
-        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${var.db_iam_username}\";
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO \"${var.db_iam_username}\";
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO \"${var.db_iam_username}\";
-        RAISE NOTICE 'Successfully created IAM user: ${var.db_iam_username}';
-    ELSE
-        RAISE NOTICE 'IAM user already exists: ${var.db_iam_username}';
-    END IF;
-END \$\$;" 2>&1; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] IAM user setup completed successfully"
-    
-    # Verify user creation
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Verifying IAM user creation..."
-    psql "host=${aws_db_instance.postgresql.address} port=${aws_db_instance.postgresql.port} user=${var.db_username} dbname=${var.db_name} sslmode=require" -c "
-SELECT 
-    usename as username,
-    usesuper as is_superuser,
-    usecreatedb as can_create_db,
-    userepl as can_replicate
-FROM pg_user 
-WHERE usename = '${var.db_iam_username}';" 2>&1
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to create IAM user via Terraform"
-    echo "The IAM user will be created via user_data script instead."
-    exit 0  # Don't fail the terraform apply
-fi
-EOT
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /home/ubuntu/create_iam_user.sh",
+      "sudo DB_PASSWORD='${local.fixed_password}' IAM_USERNAME=${var.db_iam_username} DB_PORT=${aws_db_instance.postgresql.port} DB_USERNAME=${var.db_username} DB_NAME=${var.db_name} DB_HOST=${aws_db_instance.postgresql.address} /home/ubuntu/create_iam_user.sh"
+    ]
   }
 
   # Trigger recreation if database endpoint changes
@@ -323,10 +196,3 @@ EOT
     database_username = var.db_iam_username
   }
 }
-
-# Note: This null_resource attempts to create the IAM user from Terraform runner.
-# If it fails due to network access, the user_data script will handle it instead.
-# This provides redundancy - either Terraform creates the user, or EC2 does.
-#
-# The PostgreSQL IAM user creation is essential for IAM authentication to work.
-# Without it, the TFE application will not be able to authenticate to the database.

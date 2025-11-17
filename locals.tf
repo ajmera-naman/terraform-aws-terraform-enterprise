@@ -30,7 +30,6 @@ locals {
     username   = null
     parameters = null
     iam_user_setup_status = null
-    postgres_iam_setup_ssm_document = null
   }
 
   aurora_database = try(module.aurora_database[0], local.default_database)
@@ -48,6 +47,9 @@ locals {
 
   # PostgreSQL IAM authentication flag
   database_passwordless_aws_use_iam = var.database_passwordless_aws_use_iam || (var.postgres_enable_iam_auth && !var.postgres_use_password_auth)
+  
+  # Database IAM instance profile - use the existing service account profile
+  database_iam_instance_profile = local.service_accounts_iam_instance_profile_name
 
   database = local.selected_database
 
